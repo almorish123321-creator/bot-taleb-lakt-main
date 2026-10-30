@@ -1783,7 +1783,12 @@ async def setup_bot_handlers():
 
     @bot.on(events.NewMessage(pattern=r'^/unmyfwd$'))
     async def unmyfwd_cmd_handler(event):
-        """إلغاء اعتماد القروب الحالي كقروب توجيه — متاح لكل مستخدم"""
+        """إلغاء اعتماد القروب الحالي كقروب توجيه — متاح لكل مستخدم
+        
+        يلغي القروب من:
+        - USER_GROUPS (قروبات المستخدم الشخصية)
+        - ACCOUNT_GROUPS (قروبات حسابات المستخدم المراقبة)
+        """
         user_id = event.sender_id
         if event.is_private:
             await event.respond(
@@ -1793,19 +1798,50 @@ async def setup_bot_handlers():
             return
         config = load_json_config()
         gid = int(event.chat_id)
+        changes = []
+        
+        # 1) إلغاء من USER_GROUPS (قروبات المستخدم الشخصية)
         ug = config.get('USER_GROUPS', {})
         lst = ug.get(str(user_id), [])
-        if gid not in lst:
-            await event.respond("ℹ️ هذا القروب غير معتمد لديك.")
+        if gid in lst:
+            lst.remove(gid)
+            ug[str(user_id)] = lst
+            changes.append("قروباتك الشخصية")
+        
+        # 2) إلغاء من ACCOUNT_GROUPS (قروبات حساباتك المراقبة)
+        ag_map = config.get('ACCOUNT_GROUPS', {})
+        owned_accounts = get_owned_accounts(user_id)
+        # الأدمن الكامل يقدر يلغي لأي حساب
+        if is_full_admin(user_id):
+            accounts_to_check = list(ag_map.keys())
+        else:
+            accounts_to_check = [p for p in owned_accounts if p in ag_map]
+        for phone in accounts_to_check:
+            acc_lst = ag_map.get(phone, [])
+            if gid in acc_lst:
+                acc_lst.remove(gid)
+                ag_map[phone] = acc_lst
+                changes.append(f"قروبات الحساب {phone}")
+        
+        if not changes:
+            await event.respond(
+                "ℹ️ هذا القروب غير معتمد لديك.\n\n"
+                "💡 تأكد أنك في **نفس القروب** المعتمد سابقاً.\n"
+                "💡 لإدارة اعتماداتك: افتح البوت → ✅ اعتمادات قروبات التوجيه → 📱 اعتمادات الحسابات المراقبة"
+            )
             return
-        lst.remove(gid)
-        ug[str(user_id)] = lst
+        
         config['USER_GROUPS'] = ug
+        config['ACCOUNT_GROUPS'] = ag_map
         update_json_config(config)
+        
+        changes_text = "، ".join(changes)
         await event.respond(
-            "🗑 **تم إلغاء اعتماد القروب** — لن تصلك نسخ رسائل حساباتك هنا بعد الآن."
+            f"🗑 **تم إلغاء اعتماد القروب** بنجاح!\n\n"
+            f"📋 أُلغي من: {changes_text}\n\n"
+            f"📨 لن تصلك نسخ رسائل حساباتك هنا بعد الآن."
         )
-        logger.info(f"🗑 المستخدم {user_id} ألغى اعتماد قروب التوجيه {gid} عبر /unmyfwd")
+        logger.info(f"🗑 المستخدم {user_id} ألغى اعتماد قروب التوجيه {gid} عبر /unmyfwd — {changes_text}")
 
     # دالة بناء شاشة الرتب والصلاحيات (تُستخدم في عدة أماكن)
     def build_perm_screen(admin_id_str, cfg):
