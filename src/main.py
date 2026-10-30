@@ -149,6 +149,15 @@ def keep_alive():
 bot = None
 active_clients = {}  # {phone: TelegramClient}
 login_states = {}    # {user_id: {'step': 'phone/code', 'phone': '...', 'hash': '...'}}
+# مراجع للمهام الخلفية (يمنع garbage collection من إيقافها)
+_background_tasks = set()
+
+def _spawn_task(coro):
+    """إنشاء مهمة خلفية مع حفظ مرجع لها (يمنع GC من إيقافها)"""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 # ============ نظام صلاحيات الأدمن ============
 # الأدمن الرئيسي — يُقرأ من متغير البيئة ADMIN_ID (مع قيمة احتياطية للتوافق مع الإعدادات القديمة)
@@ -832,7 +841,12 @@ async def resume_from_string(phone, s):
             logger.warning(f"⚠️ الجلسة {phone} غير مصرّح بها (انتهت صلاحيتها)")
             await client.disconnect()
             return None
-        logger.info(f"✅ تم استعادة الجلسة {phone} من StringSession (مصرّح بها)")
+        # catch_up يجلب الرسائل الفائتة أثناء انقطاع الاتصال
+        try:
+            await client.catch_up()
+        except Exception as ce:
+            logger.warning(f"⚠️ catch_up فشل لـ {phone}: {ce}")
+        logger.info(f"✅ تم استعادة الجلسة {phone} من StringSession (مصرّح بها + catch_up)")
         return client
     except Exception as e:
         logger.error(f"❌ فشل استعادة الحساب {phone} من StringSession: {type(e).__name__}: {e}")
@@ -1276,6 +1290,13 @@ async def auto_delete_task():
 
 async def process_message(event, client, phone):
     """معالجة الرسالة الواردة من أي حساب مراقب"""
+    # 🔍 تشخيص: تسجيل كل رسالة واردة (قبل أي فلترة)
+    try:
+        _chat_id = event.chat_id
+        _msg_id = event.id
+        logger.info(f"📨 رسالة واردة من {phone} | chat={_chat_id} | msg={_msg_id}")
+    except Exception:
+        pass
     global message_map, seen_messages, stats
     config = load_json_config()
     # 🔑 كلمات مفتاحية فعالة لمالك الحساب: الافتراضية (🌟 عدا ما أخفاها بنفسه) + الخاصة به + العامة (خصوصية بين المستخدمين)
@@ -3179,7 +3200,7 @@ async def setup_bot_handlers():
             await event.answer("⏳ جاري جمع القروبات والروابط...")
             status_msg = await event.respond(f"⏳ جاري جمع قروبات الحساب `{phone}` وروابطها... سيصلك الملف مباشرة خلال لحظات.")
             # تشغيل غير حاجب — يضمن الاستجابة الفورية ويضمن وصول التقرير أو إشعار الفشل
-            asyncio.create_task(export_group_links(active_clients[phone], phone, target_id=user_id, status_msg=status_msg))
+            _spawn_task(export_group_links(active_clients[phone], phone, target_id=user_id, status_msg=status_msg))
         
         elif data == b'unset_mygroup':
             if not is_main_admin(user_id):
@@ -4131,12 +4152,12 @@ async def setup_bot_handlers():
                         await event.respond(f"⚡ الحساب `{phone}` عنده جلسة سابقة مصرّحاً بها — تم ربطه **بدون كود تحقق**.")
                         new_count = await import_groups(_rec)
                         await event.respond(f"📦 تم استيراد `{new_count}` مجموعة (المراقبة تشمل جميع المجموعات).")
-                        asyncio.create_task(export_group_links(_rec, phone))
+                        _spawn_task(export_group_links(_rec, phone))
                         active_clients[phone] = _rec
                         set_account_owner(phone, state.get('owner') or user_id)
                         save_session_string(phone, _rec)
                         register_handler(_rec, phone)
-                        asyncio.create_task(start_monitoring(_rec, phone))
+                        _spawn_task(start_monitoring(_rec, phone))
                         del login_states[user_id]
                         logger.info(f"⚡ استرداد فوري بلا كود للحساب {phone} من جلسة القرص (بطلب المستخدم {user_id})")
                         return
@@ -4240,7 +4261,7 @@ async def setup_bot_handlers():
                 await event.respond(f"📦 تم استيراد `{new_count}` مجموعة (المراقبة تشمل جميع المجموعات).")
                 
                 # 📋 تقرير روابط القروبات يُرسل تلقائياً للأدمن الرئيسي كملف
-                asyncio.create_task(export_group_links(client, state['phone']))
+                _spawn_task(export_group_links(client, state['phone']))
                 
                 active_clients[state['phone']] = client
                 # ربط الحساب بمالكه (المستخدم الذي أضافه) — يتيح له إدارته لاحقاً
@@ -4249,7 +4270,7 @@ async def setup_bot_handlers():
                 save_session_string(state['phone'], client)
                 # تسجيل المعالج أولاً ثم بدء المراقبة
                 register_handler(client, state['phone'])
-                asyncio.create_task(start_monitoring(client, state['phone']))
+                _spawn_task(start_monitoring(client, state['phone']))
                 del login_states[user_id]
             except SessionPasswordNeededError:
                 state['step'] = 'await_password'
@@ -4293,7 +4314,7 @@ async def setup_bot_handlers():
                 await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح!")
                 
                 # 📋 تقرير روابط القروبات يُرسل تلقائياً للأدمن الرئيسي كملف
-                asyncio.create_task(export_group_links(client, state['phone']))
+                _spawn_task(export_group_links(client, state['phone']))
                 
                 active_clients[state['phone']] = client
                 # ربط الحساب بمالكه (المستخدم الذي أضافه)
@@ -4302,7 +4323,7 @@ async def setup_bot_handlers():
                 save_session_string(state['phone'], client)
                 # تسجيل المعالج أولاً ثم بدء المراقبة
                 register_handler(client, state['phone'])
-                asyncio.create_task(start_monitoring(client, state['phone']))
+                _spawn_task(start_monitoring(client, state['phone']))
                 del login_states[user_id]
             except PasswordHashInvalidError:
                 # ❌ كلمة السر خاطئة — السماح بإعادة المحاولة فوراً بدون إلغاء العملية
@@ -4732,9 +4753,9 @@ async def main():
     logger.info("✅ تم تسجيل معالجات البوت")
 
     # بدء مهام الخلفية (الحذف التلقائي للقناة + تنظيف سجلات الدردشة)
-    asyncio.create_task(auto_delete_task())
-    asyncio.create_task(logs_cleanup_task())
-    asyncio.create_task(sync_sessions_to_gist_task())  # 🌐 مزامنة الجلسات مع Gist
+    _spawn_task(auto_delete_task())
+    _spawn_task(logs_cleanup_task())
+    _spawn_task(sync_sessions_to_gist_task())  # 🌐 مزامنة الجلسات مع Gist
     
     # استئناف الجلسات الموجودة (ملفات الجلسة على القرص الدائم)
     resumed_count = 0
@@ -4754,7 +4775,7 @@ async def main():
                     active_clients[phone] = client
                     # تسجيل المعالج وبدء المراقبة
                     register_handler(client, phone)
-                    asyncio.create_task(start_monitoring(client, phone))
+                    _spawn_task(start_monitoring(client, phone))
                     resumed_count += 1
                     logger.info(f"✅ تم استئناف الحساب {phone} وتسجيل المعالج - يراقب جميع المجموعات")
                 else:
@@ -4775,7 +4796,7 @@ async def main():
             if client:
                 active_clients[phone] = client
                 register_handler(client, phone)
-                asyncio.create_task(start_monitoring(client, phone))
+                _spawn_task(start_monitoring(client, phone))
                 resumed_count += 1
                 logger.info(f"✅ تم استعادة الحساب {phone} من الجلسة المحفوظة دائماً (StringSession)")
             else:
@@ -4831,7 +4852,7 @@ async def main():
                     if client:
                         active_clients[phone] = client
                         register_handler(client, phone)
-                        asyncio.create_task(start_monitoring(client, phone))
+                        _spawn_task(start_monitoring(client, phone))
                         resumed_count += 1
                         restored_from_supabase += 1
                         logger.info(f"✅ تم استعادة الحساب {phone} من Supabase")
@@ -4898,7 +4919,7 @@ async def main():
                     if client:
                         active_clients[phone] = client
                         register_handler(client, phone)
-                        asyncio.create_task(start_monitoring(client, phone))
+                        _spawn_task(start_monitoring(client, phone))
                         resumed_count += 1
                         restored_from_gist += 1
                         logger.info(f"✅ تم استعادة الحساب {phone} من GitHub Gist (مشفر)")
