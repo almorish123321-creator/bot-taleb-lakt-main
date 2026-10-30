@@ -13,15 +13,22 @@ from telethon.tl.functions.messages import ExportChatInviteRequest, CheckChatInv
 from flask import Flask
 from threading import Thread
 from config import API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID, load_json_config, update_json_config as _update_json_config_original, DATA_DIR
+import supabase_persistence
 import github_persistence
 
 
-# ===== تجاوز update_json_config لحفظ كل الإعدادات في GitHub Gist تلقائياً =====
+# ===== تجاوز update_json_config لحفظ كل الإعدادات في Supabase + GitHub Gist =====
+# الأولوية: Supabase (سريع وفوري)، ثم Gist (نسخة احتياطية)
 def update_json_config(config):
-    """حفظ الإعدادات محلياً + في GitHub Gist (مشفر) — كل الإعدادات تبقى بعد كل تحديث"""
+    """حفظ الإعدادات محلياً + في Supabase + GitHub Gist — كل الإعدادات تبقى بعد كل تحديث"""
     # 1) حفظ محلي
     _update_json_config_original(config)
-    # 2) حفظ في GitHub Gist (كل الإعدادات)
+    # 2) حفظ في Supabase (الأولوية — سريع وفوري)
+    try:
+        supabase_persistence.save_full_config(config)
+    except Exception as e:
+        logger.warning(f"⚠️ فشل حفظ الإعدادات في Supabase: {e}")
+    # 3) حفظ في GitHub Gist (نسخة احتياطية)
     try:
         github_persistence.save_all_settings(config)
     except Exception as e:
@@ -111,6 +118,7 @@ def stats_endpoint():
         "seen_messages_size": len(seen_messages),
         "data_dir": DATA_DIR,
         "sessions_persisted": len(load_json_config().get('SESSIONS', {})),
+        "supabase_persistence": supabase_persistence.get_status() if hasattr(supabase_persistence, 'get_status') else None,
         "github_persistence": github_persistence.get_status() if hasattr(github_persistence, 'get_status') else None,
         "admin_group_id": config.get('ADMIN_GROUP_ID', 0),
         "official_group": OFFICIAL_GROUP,
@@ -736,21 +744,26 @@ def ensure_user_registered(user_id):
 
 def save_session_string(phone, client):
     """حفظ جلسة الحساب كسلسلة نصية داخل config.json
-    — update_json_config يحفظها تلقائياً في GitHub Gist أيضاً"""
+    — update_json_config يحفظها تلقائياً في Supabase + GitHub Gist"""
     try:
         s = StringSession.save(client.session)
         config = load_json_config()
         sess = config.get('SESSIONS', {})
         sess[str(phone)] = s
         config['SESSIONS'] = sess
+        # حفظ owner_id من ACCOUNT_OWNERS
+        owner = config.get('ACCOUNT_OWNERS', {}).get(str(phone))
         update_json_config(config)
-        logger.info(f"💾 تم حفظ جلسة {phone} بشكل دائم (StringSession + GitHub Gist)")
+        # حفظ مباشر في Supabase (أسرع من المرور عبر update_json_config للجلسات)
+        if supabase_persistence.is_configured():
+            supabase_persistence.save_session(str(phone), s, owner)
+        logger.info(f"💾 تم حفظ جلسة {phone} بشكل دائم (StringSession + Supabase + Gist)")
     except Exception as e:
         logger.error(f"فشل حفظ StringSession لـ {phone}: {e}")
 
 def forget_session_string(phone):
     """إزالة الجلسة المحفوظة من config عند حذف الحساب
-    — update_json_config يحدّث GitHub Gist تلقائياً"""
+    — update_json_config يحدّث Supabase + GitHub Gist تلقائياً"""
     try:
         config = load_json_config()
         sess = config.get('SESSIONS', {})
@@ -764,6 +777,9 @@ def forget_session_string(phone):
             removed = True
         if removed:
             update_json_config(config)
+        # حذف مباشر من Supabase
+        if supabase_persistence.is_configured():
+            supabase_persistence.delete_session(str(phone))
     except Exception:
         pass
 
@@ -1191,18 +1207,17 @@ async def logs_cleanup_task():
 # ============ الحذف التلقائي ============
 
 async def sync_sessions_to_gist_task():
-    """🌐 مهمة خلفية: مزامنة الجلسات النشطة مع GitHub Gist كل 5 دقائق
+    """🌐 مهمة خلفية: مزامنة الجلسات النشطة مع Supabase + GitHub Gist كل 5 دقائق
 
-    تضمن أن أي جلسة نشطة في active_clients تُحفظ في Gist
-    حتى لو فات save_session_string لأي سبب (مثلاً: تحديث البوت
-    أثناء إضافة الحساب، أو خطأ في حفظ الجلسة)
+    تضمن أن أي جلسة نشطة في active_clients تُحفظ في Supabase + Gist
+    حتى لو فات save_session_string لأي سبب
     """
     while True:
         try:
             await asyncio.sleep(300)  # كل 5 دقائق
             if not active_clients:
                 continue
-            if not github_persistence.is_configured():
+            if not (supabase_persistence.is_configured() or github_persistence.is_configured()):
                 continue
 
             config = load_json_config()
@@ -1212,17 +1227,19 @@ async def sync_sessions_to_gist_task():
 
             for phone, client in active_clients.items():
                 try:
-                    # التأكد أن الجلسة متصلة ومصرّح بها
                     if not client.is_connected():
                         continue
                     if not await client.is_user_authorized():
                         continue
-                    # توليد StringSession من الجلسة الحالية
                     s = StringSession.save(client.session)
                     if str(phone) not in local_sessions or local_sessions[str(phone)] != s:
                         local_sessions[str(phone)] = s
                         config_changed = True
                         saved_count += 1
+                    # حفظ مباشر في Supabase (أسرع)
+                    if supabase_persistence.is_configured():
+                        owner = config.get('ACCOUNT_OWNERS', {}).get(str(phone))
+                        supabase_persistence.save_session(str(phone), s, owner)
                 except Exception as e:
                     logger.warning(f"⚠️ فشل مزامنة جلسة {phone}: {e}")
                     continue
@@ -1230,7 +1247,7 @@ async def sync_sessions_to_gist_task():
             if config_changed:
                 config['SESSIONS'] = local_sessions
                 update_json_config(config)
-                logger.info(f"🌐 مزامنة Gist: تم حفظ/تحديث {saved_count} جلسة نشطة")
+                logger.info(f"🌐 مزامنة: تم حفظ/تحديث {saved_count} جلسة نشطة في Supabase + Gist")
         except Exception as e:
             logger.error(f"❌ خطأ في مهمة مزامنة الجلسات: {e}")
 
@@ -4640,9 +4657,73 @@ async def main():
     except Exception as e:
         logger.error(f"خطأ في استعادة الجلسات المحفوظة: {e}")
 
-    # 🌐 استعادة كل الإعدادات من GitHub Gist (مشفر) — تبقى حتى بعد إعادة النشر
+    # 🌐 استعادة كل الإعدادات من Supabase (الأولوية) + GitHub Gist (نسخة احتياطية)
+    # تبقى حتى بعد إعادة النشر في Render free tier
     try:
-        if github_persistence.is_configured():
+        # ===== 1) محاولة Supabase أولاً (الأسرع والأكثر موثوقية) =====
+        if supabase_persistence.is_configured():
+            logger.info("🌐 محاولة استعادة كل الإعدادات من Supabase...")
+            supabase_data = supabase_persistence.load_full_config()
+            if supabase_data and (supabase_data.get("SESSIONS") or supabase_data.get("KEYWORDS") or supabase_data.get("ADMINS")):
+                # تحميل config المحلي ودمجه مع البيانات من Supabase
+                config = load_json_config()
+                config_changed = False
+                # دمج كل المفاتيح من Supabase في config
+                for key in supabase_persistence.PERSISTED_KEYS:
+                    supabase_value = supabase_data.get(key)
+                    local_value = config.get(key)
+                    if supabase_value is not None:
+                        if local_value is None or local_value == _default_for_key_local(key):
+                            config[key] = supabase_value
+                            config_changed = True
+                        elif isinstance(supabase_value, list) and isinstance(local_value, list):
+                            for item in supabase_value:
+                                if item not in local_value:
+                                    local_value.append(item)
+                                    config_changed = True
+                            if config_changed:
+                                config[key] = local_value
+                        elif isinstance(supabase_value, dict) and isinstance(local_value, dict):
+                            for k, v in supabase_value.items():
+                                if k not in local_value:
+                                    local_value[k] = v
+                                    config_changed = True
+                            if config_changed:
+                                config[key] = local_value
+                if config_changed:
+                    update_json_config(config)
+                    logger.info(f"📂 تم تحديث config بالإعدادات المستعادة من Supabase")
+                # استعادة الحسابات من Supabase
+                supabase_sessions = supabase_data.get("SESSIONS", {})
+                restored_from_supabase = 0
+                for phone, s in supabase_sessions.items():
+                    if phone in active_clients:
+                        continue
+                    if os.path.exists(os.path.join(SESSION_DIR, f'session_{phone}.session')):
+                        continue
+                    client = await resume_from_string(phone, s)
+                    if client:
+                        active_clients[phone] = client
+                        register_handler(client, phone)
+                        asyncio.create_task(start_monitoring(client, phone))
+                        resumed_count += 1
+                        restored_from_supabase += 1
+                        logger.info(f"✅ تم استعادة الحساب {phone} من Supabase")
+                    else:
+                        logger.warning(f"⚠️ تعذّر استعادة الحساب {phone} من Supabase (انتهت صلاحية الجلسة)")
+                if restored_from_supabase > 0:
+                    logger.info(f"🌐 تم استعادة {restored_from_supabase} حساب من Supabase")
+                logger.info(f"📋 ملخص الاستعادة من Supabase:")
+                logger.info(f"   - جلسات: {len(supabase_sessions)}")
+                logger.info(f"   - كلمات مفتاحية: {len(supabase_data.get('KEYWORDS', []))}")
+                logger.info(f"   - مشرفون: {len(supabase_data.get('ADMINS', []))}")
+                logger.info(f"   - قروبات توجيه: {len(supabase_data.get('FORWARD_GROUPS', []))}")
+            else:
+                logger.info("ℹ️ Supabase فارغ — محاولة GitHub Gist")
+
+        # ===== 2) لو Supabase غير مضبوط أو فارغ، نحاول GitHub Gist =====
+        supabase_empty = not supabase_persistence.is_configured() or not (locals().get('supabase_data') and (supabase_data.get("SESSIONS") or supabase_data.get("KEYWORDS") or supabase_data.get("ADMINS")))
+        if supabase_empty and github_persistence.is_configured():
             logger.info("🌐 محاولة استعادة كل الإعدادات من GitHub Gist...")
             gist_data = github_persistence.load_all_settings()
             if gist_data:

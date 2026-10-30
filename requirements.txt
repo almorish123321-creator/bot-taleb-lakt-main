@@ -4,3 +4,4 @@ aiohttp
 requests
 flask
 cryptography
+supabase
