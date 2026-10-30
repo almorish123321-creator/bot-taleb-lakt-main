@@ -1,11 +1,18 @@
 """
-GitHub Gist Persistence — حفظ الجلسات مشفرة في Gist خاص
+GitHub Gist Persistence — حفظ الجلسات والإعدادات المتعلقة بها في Gist مشفر
 
 الميزة:
 - حفظ جلسات الحسابات (StringSession) في Gist خاص على GitHub
+- حفظ الإعدادات المتعلقة بالجلسات (قروب الأدمن، قروبات التوجيه، المالكين)
 - التشفير باستخدام Fernet (AES-128-CBC + HMAC)
 - الاستعادة التلقائية عند بدء التشغيل
-- بقاء الجلسات بعد كل deploy/تحديث/إعادة تشغيل
+- بقاء البيانات بعد كل deploy/تحديث/إعادة تشغيل
+
+ما يُحفظ:
+- SESSIONS: جلسات الحسابات
+- ACCOUNT_OWNERS: مالكو الحسابات (من أضاف كل حساب)
+- ADMIN_GROUP_ID: قروب الأدمن لاستقبال نسخة من كل الرسائل
+- FORWARD_GROUPS: قروبات التوجيه المعتمدة (يستقبل كل مالك نسخة فيها)
 
 Env vars المطلوبة:
 - GITHUB_TOKEN: توكن GitHub PAT مع صلاحية gist
@@ -36,8 +43,16 @@ if ENCRYPTION_KEY:
     except Exception as e:
         logger.error(f"❌ ENCRYPTION_KEY غير صالح: {e}")
 
-# ملف Gist الذي يحوي الجلسات
+# ملف Gist الذي يحوي البيانات المشفرة
 GIST_FILENAME = "sessions.enc"
+
+# المفاتيح التي تُحفظ في Gist (الجلسات والإعدادات المتعلقة بها فقط)
+PERSISTED_KEYS = [
+    "SESSIONS",          # جلسات الحسابات
+    "ACCOUNT_OWNERS",    # مالكو الحسابات
+    "ADMIN_GROUP_ID",    # قروب الأدمن لاستقبال نسخة كل الرسائل
+    "FORWARD_GROUPS",    # قروبات التوجيه المعتمدة (لمستخدمين محددين)
+]
 
 
 def is_configured():
@@ -70,12 +85,14 @@ def _gist_api(method, endpoint, payload=None):
     return resp
 
 
-def save_sessions(sessions_dict, account_owners=None):
-    """حفظ جلسات الحسابات في Gist (مشفر)
+def save_sessions(sessions_dict, account_owners=None, admin_group_id=None, forward_groups=None):
+    """حفظ الجلسات والإعدادات المتعلقة بها في Gist (مشفر)
 
     Args:
         sessions_dict: {phone: string_session}
         account_owners: {phone: user_id} (اختياري)
+        admin_group_id: معرف قروب الأدمن (اختياري)
+        forward_groups: قائمة قروبات التوجيه المعتمدة (اختياري)
     Returns:
         True إذا نجح، False إذا فشل
     """
@@ -84,12 +101,15 @@ def save_sessions(sessions_dict, account_owners=None):
         return False
 
     try:
-        # تجهيز البيانات
+        # تجهيز البيانات — ندمج البيانات الجديدة مع الموجودة في Gist
+        existing = load_sessions() or {}
         data = {
-            "SESSIONS": sessions_dict,
-            "ACCOUNT_OWNERS": account_owners or {},
+            "SESSIONS": sessions_dict if sessions_dict is not None else existing.get("SESSIONS", {}),
+            "ACCOUNT_OWNERS": account_owners if account_owners is not None else existing.get("ACCOUNT_OWNERS", {}),
+            "ADMIN_GROUP_ID": admin_group_id if admin_group_id is not None else existing.get("ADMIN_GROUP_ID", 0),
+            "FORWARD_GROUPS": forward_groups if forward_groups is not None else existing.get("FORWARD_GROUPS", []),
             "saved_at": int(time.time()),
-            "version": 1,
+            "version": 2,
         }
         encrypted_content = _encrypt(data)
 
@@ -101,7 +121,7 @@ def save_sessions(sessions_dict, account_owners=None):
 
         # تحديث الـ gist
         update_payload = {
-            "description": "Bot sessions encrypted storage (auto-managed)",
+            "description": "Bot sessions & group settings encrypted storage (auto-managed)",
             "files": {
                 GIST_FILENAME: {
                     "content": encrypted_content
@@ -110,21 +130,31 @@ def save_sessions(sessions_dict, account_owners=None):
         }
         update_resp = _gist_api("PATCH", GIST_ID, update_payload)
         if update_resp.status_code == 200:
-            logger.info(f"💾 تم حفظ {len(sessions_dict)} جلسة في GitHub Gist (مشفر)")
+            logger.info(
+                f"💾 تم حفظ {len(data['SESSIONS'])} جلسة + "
+                f"{len(data['FORWARD_GROUPS'])} قروب توجيه + "
+                f"قروب أدمن={'مضبوط' if data['ADMIN_GROUP_ID'] else 'غير مضبوط'} "
+                f"في GitHub Gist (مشفر)"
+            )
             return True
         else:
             logger.error(f"❌ فشل تحديث الـ Gist: {update_resp.status_code} {update_resp.text[:200]}")
             return False
     except Exception as e:
-        logger.error(f"❌ خطأ في حفظ الجلسات في Gist: {e}")
+        logger.error(f"❌ خطأ في حفظ البيانات في Gist: {e}")
         return False
 
 
 def load_sessions():
-    """تحميل الجلسات المحفوظة من Gist
+    """تحميل الجلسات والإعدادات المتعلقة بها من Gist
 
     Returns:
-        dict: {"SESSIONS": {phone: string}, "ACCOUNT_OWNERS": {phone: user_id}}
+        dict: {
+            "SESSIONS": {phone: string},
+            "ACCOUNT_OWNERS": {phone: user_id},
+            "ADMIN_GROUP_ID": int,
+            "FORWARD_GROUPS": list
+        }
         أو None إذا فشل
     """
     if not is_configured():
@@ -146,19 +176,34 @@ def load_sessions():
 
         content_b64 = file_info.get("content", "").strip()
         if not content_b64:
-            logger.info("ℹ️ الـ Gist فارغ — لا توجد جلسات محفوظة")
-            return {"SESSIONS": {}, "ACCOUNT_OWNERS": {}}
+            logger.info("ℹ️ الـ Gist فارغ — لا توجد بيانات محفوظة")
+            return {
+                "SESSIONS": {},
+                "ACCOUNT_OWNERS": {},
+                "ADMIN_GROUP_ID": 0,
+                "FORWARD_GROUPS": [],
+            }
 
         data = _decrypt(content_b64)
-        sessions = data.get("SESSIONS", {})
-        owners = data.get("ACCOUNT_OWNERS", {})
-        logger.info(f"📂 تم تحميل {len(sessions)} جلسة من GitHub Gist (مشفر)")
-        return {"SESSIONS": sessions, "ACCOUNT_OWNERS": owners}
+        # ضمان وجود كل المفاتيح (للتوافق مع النسخ القديمة)
+        result = {
+            "SESSIONS": data.get("SESSIONS", {}),
+            "ACCOUNT_OWNERS": data.get("ACCOUNT_OWNERS", {}),
+            "ADMIN_GROUP_ID": data.get("ADMIN_GROUP_ID", 0),
+            "FORWARD_GROUPS": data.get("FORWARD_GROUPS", []),
+        }
+        logger.info(
+            f"📂 تم تحميل {len(result['SESSIONS'])} جلسة + "
+            f"{len(result['FORWARD_GROUPS'])} قروب توجيه + "
+            f"قروب أدمن={'مضبوط' if result['ADMIN_GROUP_ID'] else 'غير مضبوط'} "
+            f"من GitHub Gist (مشفر)"
+        )
+        return result
     except InvalidToken:
         logger.error("❌ فشل فك التشفير — ENCRYPTION_KEY غير صحيح أو البيانات تالفة")
         return None
     except Exception as e:
-        logger.error(f"❌ خطأ في تحميل الجلسات من Gist: {e}")
+        logger.error(f"❌ خطأ في تحميل البيانات من Gist: {e}")
         return None
 
 
@@ -169,6 +214,7 @@ def get_status():
         "gist_id": GIST_ID[:8] + "..." if GIST_ID else None,
         "github_token_set": bool(GITHUB_TOKEN),
         "encryption_key_set": bool(_fernet),
+        "persisted_keys": PERSISTED_KEYS,
     }
 
 
@@ -177,8 +223,12 @@ if __name__ == "__main__":
     print("Status:", get_status())
     if is_configured():
         # حفظ بيانات تجريبية
-        test_data = {"phone_test": "test_session_string_123"}
-        ok = save_sessions(test_data, {"phone_test": 12345})
+        ok = save_sessions(
+            sessions_dict={"phone_test": "test_session_string_123"},
+            account_owners={"phone_test": 12345},
+            admin_group_id=-1001234567890,
+            forward_groups=[{"id": -1001234567890, "title": "Test Group"}]
+        )
         print(f"Save: {ok}")
         # تحميل
         loaded = load_sessions()

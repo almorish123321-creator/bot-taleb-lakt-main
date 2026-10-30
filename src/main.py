@@ -735,7 +735,9 @@ def save_session_string(phone, client):
         # 💾 حفظ نسخة احتياطية في GitHub Gist (مشفر) — تبقى حتى بعد إعادة النشر
         try:
             owners = config.get('ACCOUNT_OWNERS', {})
-            github_persistence.save_sessions(sess, owners)
+            admin_group_id = config.get('ADMIN_GROUP_ID', 0)
+            forward_groups = config.get('FORWARD_GROUPS', [])
+            github_persistence.save_sessions(sess, owners, admin_group_id, forward_groups)
         except Exception as ge:
             logger.warning(f"⚠️ فشل حفظ الجلسة في GitHub Gist: {ge}")
     except Exception as e:
@@ -760,12 +762,31 @@ def forget_session_string(phone):
             # تحديث GitHub Gist
             try:
                 owners = config.get('ACCOUNT_OWNERS', {})
-                github_persistence.save_sessions(sess, owners)
+                admin_group_id = config.get('ADMIN_GROUP_ID', 0)
+                forward_groups = config.get('FORWARD_GROUPS', [])
+                github_persistence.save_sessions(sess, owners, admin_group_id, forward_groups)
                 logger.info(f"🗑️ تم حذف جلسة {phone} من GitHub Gist أيضاً")
             except Exception as ge:
                 logger.warning(f"⚠️ فشل تحديث GitHub Gist بعد الحذف: {ge}")
     except Exception:
         pass
+
+
+def save_group_settings_to_gist():
+    """حفظ إعدادات القروبات (ADMIN_GROUP_ID + FORWARD_GROUPS) في GitHub Gist
+    يُستدعى عند تغيير قروب الأدمن أو قروبات التوجيه"""
+    try:
+        if not github_persistence.is_configured():
+            return False
+        config = load_json_config()
+        sess = config.get('SESSIONS', {})
+        owners = config.get('ACCOUNT_OWNERS', {})
+        admin_group_id = config.get('ADMIN_GROUP_ID', 0)
+        forward_groups = config.get('FORWARD_GROUPS', [])
+        return github_persistence.save_sessions(sess, owners, admin_group_id, forward_groups)
+    except Exception as e:
+        logger.warning(f"⚠️ فشل حفظ إعدادات القروبات في Gist: {e}")
+        return False
 
 async def resume_from_string(phone, s):
     """استعادة حساب مراقب من StringSession المحفوظة في config
@@ -1583,6 +1604,7 @@ async def setup_bot_handlers():
         config = load_json_config()
         config['ADMIN_GROUP_ID'] = event.chat_id
         update_json_config(config)
+        save_group_settings_to_gist()
         await event.respond(
             "✅ **تم تعيين هذا القروب كمستقبل النسخ الشامل!**\n\n"
             "📨 كل رسالة تُوجّه لقروبات المشتركين ستُرسل نسخة منها هنا أيضاً.\n"
@@ -1598,6 +1620,7 @@ async def setup_bot_handlers():
         config = load_json_config()
         config['ADMIN_GROUP_ID'] = 0
         update_json_config(config)
+        save_group_settings_to_gist()
         await event.respond("✅ تم إلغاء قروب النسخ الشامل — لن تُرسل نسخ من الرسائل لقروبك.")
         logger.info("📤 تم إلغاء قروب النسخ الشامل")
 
@@ -2945,6 +2968,7 @@ async def setup_bot_handlers():
                 return
             config['ADMIN_GROUP_ID'] = 0
             update_json_config(config)
+            save_group_settings_to_gist()
             await event.respond("✅ تم إلغاء قروب النسخ الشامل.")
         
         # ============ قروب استقبال كل الرسائل (للأدمن) ============
@@ -2987,6 +3011,7 @@ async def setup_bot_handlers():
                 title = getattr(entity, 'title', None) or str(og_id)
                 config['ADMIN_GROUP_ID'] = og_id
                 update_json_config(config)
+                save_group_settings_to_gist()
                 await event.respond(
                     f"✅ تم تعيين **القروب الرسمي لاستقبال كل الرسائل**!\n\n"
                     f"📤 القروب: {title} (`{og_id}`)\n"
@@ -3245,6 +3270,7 @@ async def setup_bot_handlers():
                 ug[uid_s] = [g for g in ug[uid_s] if g != gid]
             config['USER_GROUPS'] = ug
             update_json_config(config)
+            save_group_settings_to_gist()
             await event.answer("🗑 تم حذف القروب من قائمة الاعتمادات")
             logger.info(f"🗑 تم حذف قروب التوجيه {gid} بواسطة {user_id}")
         
@@ -3603,6 +3629,7 @@ async def setup_bot_handlers():
                 title = getattr(entity, 'title', None) or str(gid)
                 config['ADMIN_GROUP_ID'] = gid
                 update_json_config(config)
+                save_group_settings_to_gist()
                 await event.respond(
                     f"✅ تم تعيين **قروب استقبال كل الرسائل** بنجاح!\n\n"
                     f"📤 القروب: {title} (`{gid}`)\n\n"
@@ -3636,6 +3663,7 @@ async def setup_bot_handlers():
                     fg.append({'id': gid, 'title': title})
                     config['FORWARD_GROUPS'] = fg
                     update_json_config(config)
+                    save_group_settings_to_gist()
                     await event.respond(
                         f"✅ تم إضافة القروب إلى قائمة الاعتمادات!\n\n"
                         f"📦 القروب: {title} (`{gid}`)\n"
@@ -3676,6 +3704,8 @@ async def setup_bot_handlers():
             ug[str(user_id)] = lst
             config['USER_GROUPS'] = ug
             update_json_config(config)
+            if not already_fg:
+                save_group_settings_to_gist()
             note = "ℹ️ كان معتمداً لديك بالفعل." if re_added else "✅ تم اعتماده لحسابك الآن."
             shared_note = "" if already_fg else "\n📦 أُضيف أيضاً إلى القائمة العامة ليتيح لمستخدمين آخرين اعتماد نفس القروب."
             await event.respond(
@@ -4402,20 +4432,26 @@ async def main():
     except Exception as e:
         logger.error(f"خطأ في استعادة الجلسات المحفوظة: {e}")
 
-    # 🌐 استعادة الحسابات من GitHub Gist (مشفر) — تبقى حتى بعد إعادة النشر في Render free tier
+    # 🌐 استعادة الحسابات والإعدادات المتعلقة بها من GitHub Gist (مشفر)
+    # تبقى حتى بعد إعادة النشر في Render free tier
     try:
         if github_persistence.is_configured():
-            logger.info("🌐 محاولة استعادة الجلسات من GitHub Gist...")
+            logger.info("🌐 محاولة استعادة الجلسات والإعدادات من GitHub Gist...")
             gist_data = github_persistence.load_sessions()
             if gist_data:
                 gist_sessions = gist_data.get("SESSIONS", {})
                 gist_owners = gist_data.get("ACCOUNT_OWNERS", {})
+                gist_admin_group = gist_data.get("ADMIN_GROUP_ID", 0)
+                gist_forward_groups = gist_data.get("FORWARD_GROUPS", [])
                 restored_from_gist = 0
-                # تحديث config بالجلسات المستعادة من Gist (لو فُقدت محلياً)
+                # تحديث config بالجلسات والإعدادات المستعادة من Gist (لو فُقدت محلياً)
                 config = load_json_config()
                 local_sessions = config.get('SESSIONS', {})
                 local_owners = config.get('ACCOUNT_OWNERS', {})
+                local_admin_group = config.get('ADMIN_GROUP_ID', 0)
+                local_forward_groups = config.get('FORWARD_GROUPS', [])
                 config_changed = False
+                # استعادة الجلسات والمالكين
                 for phone, s in gist_sessions.items():
                     if phone in active_clients:
                         continue  # الحساب شغال بالفعل
@@ -4425,11 +4461,34 @@ async def main():
                     if str(phone) in gist_owners and str(phone) not in local_owners:
                         local_owners[str(phone)] = gist_owners[str(phone)]
                         config_changed = True
+                # استعادة قروب الأدمن (لو فُقد محلياً)
+                if gist_admin_group and not local_admin_group:
+                    config['ADMIN_GROUP_ID'] = gist_admin_group
+                    config_changed = True
+                    logger.info(f"📌 تم استعادة قروب الأدمن من GitHub Gist: {gist_admin_group}")
+                # استعادة قروبات التوجيه المعتمدة (لو فُقدت محلياً)
+                if gist_forward_groups and not local_forward_groups:
+                    config['FORWARD_GROUPS'] = gist_forward_groups
+                    config_changed = True
+                    logger.info(f"📦 تم استعادة {len(gist_forward_groups)} قروب توجيه من GitHub Gist")
+                elif gist_forward_groups:
+                    # دمج: إضافة أي قروب في Gist ما هو موجود محلياً
+                    existing_ids = {g.get('id') for g in local_forward_groups}
+                    merged = list(local_forward_groups)
+                    added = 0
+                    for g in gist_forward_groups:
+                        if g.get('id') not in existing_ids:
+                            merged.append(g)
+                            added += 1
+                    if added > 0:
+                        config['FORWARD_GROUPS'] = merged
+                        config_changed = True
+                        logger.info(f"📦 تم دمج {added} قروب توجيه جديد من GitHub Gist")
                 if config_changed:
                     config['SESSIONS'] = local_sessions
                     config['ACCOUNT_OWNERS'] = local_owners
                     update_json_config(config)
-                    logger.info(f"📂 تم تحديث config بـ {len(gist_sessions)} جلسة من GitHub Gist")
+                    logger.info(f"📂 تم تحديث config بالبيانات المستعادة من GitHub Gist")
 
                 # استعادة الحسابات الجديدة من GitHub Gist
                 for phone, s in gist_sessions.items():
