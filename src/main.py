@@ -820,30 +820,24 @@ def _default_for_key_local(key):
     return defaults.get(key, None)
 
 async def resume_from_string(phone, s):
-    """استعادة حساب مراقب من StringSession المحفوظة في config
-    وتحويلها لملف جلسة على القرص الدائم للاستخدام اللاحق"""
-    disk_client = None
+    """استعادة حساب مراقب من StringSession المحفوظة
+    
+    نستخدم StringSession مباشرة (بدون تحويل لملف على القرص)
+    لتجنب مشاكل database is locked وتلف ملفات الجلسة"""
     try:
-        tmp = TelegramClient(StringSession(s), API_ID, API_HASH, **CLIENT_OPTS)
-        await tmp.connect()
-        if not await tmp.is_user_authorized():
-            await tmp.disconnect()
+        # استخدام StringSession مباشرة كعميل نشط
+        client = TelegramClient(StringSession(s), API_ID, API_HASH, **CLIENT_OPTS)
+        await client.connect()
+        if not await client.is_user_authorized():
+            logger.warning(f"⚠️ الجلسة {phone} غير مصرّح بها (انتهت صلاحيتها)")
+            await client.disconnect()
             return None
-        disk_client = TelegramClient(os.path.join(SESSION_DIR, f'session_{phone}'), API_ID, API_HASH, **CLIENT_OPTS)
-        await disk_client.connect()
-        disk_client.session.set_dc(tmp.session.dc_id, tmp.session.server_address, tmp.session.port)
-        disk_client.session.auth_key = tmp.session.auth_key
-        disk_client.session.save()
-        await tmp.disconnect()
-        if await disk_client.is_user_authorized():
-            return disk_client
-        await disk_client.disconnect()
-        return None
+        logger.info(f"✅ تم استعادة الجلسة {phone} من StringSession (مصرّح بها)")
+        return client
     except Exception as e:
-        logger.error(f"فشل استعادة الحساب {phone} من الجلسة المحفوظة: {e}")
+        logger.error(f"❌ فشل استعادة الحساب {phone} من StringSession: {type(e).__name__}: {e}")
         try:
-            if disk_client:
-                await disk_client.disconnect()
+            await client.disconnect()
         except Exception:
             pass
         return None
