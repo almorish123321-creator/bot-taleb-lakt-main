@@ -4738,9 +4738,9 @@ async def main():
         saved_sessions = config.get('SESSIONS', {})
         for phone, s in saved_sessions.items():
             if phone in active_clients:
-                continue
-            if os.path.exists(os.path.join(SESSION_DIR, f'session_{phone}.session')):
-                continue  # سيُستأنف من الملف مباشرة
+                continue  # الحساب شغال بالفعل
+            # ⚠️ لا نتخطى لو وُجد ملف .session محلي — قد يكون تالفاً أو منتهي الصلاحية
+            # نحاول الاستعادة من StringSession دائماً (إلا لو الحساب شغال)
             client = await resume_from_string(phone, s)
             if client:
                 active_clients[phone] = client
@@ -4794,9 +4794,9 @@ async def main():
                 restored_from_supabase = 0
                 for phone, s in supabase_sessions.items():
                     if phone in active_clients:
-                        continue
-                    if os.path.exists(os.path.join(SESSION_DIR, f'session_{phone}.session')):
-                        continue
+                        continue  # الحساب شغال بالفعل
+                    # ⚠️ لا نتخطى لو وُجد ملف .session محلي — قد يكون تالفاً أو منتهي الصلاحية
+                    # نحاول الاستعادة من Supabase دائماً (إلا لو الحساب شغال)
                     client = await resume_from_string(phone, s)
                     if client:
                         active_clients[phone] = client
@@ -4862,9 +4862,8 @@ async def main():
                 restored_from_gist = 0
                 for phone, s in gist_sessions.items():
                     if phone in active_clients:
-                        continue
-                    if os.path.exists(os.path.join(SESSION_DIR, f'session_{phone}.session')):
-                        continue  # سيُستأنف من الملف
+                        continue  # الحساب شغال بالفعل
+                    # ⚠️ لا نتخطى لو وُجد ملف .session محلي — قد يكون تالفاً أو منتهي الصلاحية
                     client = await resume_from_string(phone, s)
                     if client:
                         active_clients[phone] = client
