@@ -1190,6 +1190,50 @@ async def logs_cleanup_task():
 
 # ============ الحذف التلقائي ============
 
+async def sync_sessions_to_gist_task():
+    """🌐 مهمة خلفية: مزامنة الجلسات النشطة مع GitHub Gist كل 5 دقائق
+
+    تضمن أن أي جلسة نشطة في active_clients تُحفظ في Gist
+    حتى لو فات save_session_string لأي سبب (مثلاً: تحديث البوت
+    أثناء إضافة الحساب، أو خطأ في حفظ الجلسة)
+    """
+    while True:
+        try:
+            await asyncio.sleep(300)  # كل 5 دقائق
+            if not active_clients:
+                continue
+            if not github_persistence.is_configured():
+                continue
+
+            config = load_json_config()
+            local_sessions = config.get('SESSIONS', {})
+            config_changed = False
+            saved_count = 0
+
+            for phone, client in active_clients.items():
+                try:
+                    # التأكد أن الجلسة متصلة ومصرّح بها
+                    if not client.is_connected():
+                        continue
+                    if not await client.is_user_authorized():
+                        continue
+                    # توليد StringSession من الجلسة الحالية
+                    s = StringSession.save(client.session)
+                    if str(phone) not in local_sessions or local_sessions[str(phone)] != s:
+                        local_sessions[str(phone)] = s
+                        config_changed = True
+                        saved_count += 1
+                except Exception as e:
+                    logger.warning(f"⚠️ فشل مزامنة جلسة {phone}: {e}")
+                    continue
+
+            if config_changed:
+                config['SESSIONS'] = local_sessions
+                update_json_config(config)
+                logger.info(f"🌐 مزامنة Gist: تم حفظ/تحديث {saved_count} جلسة نشطة")
+        except Exception as e:
+            logger.error(f"❌ خطأ في مهمة مزامنة الجلسات: {e}")
+
 async def auto_delete_task():
     """مهمة خلفية لحذف الرسائل المحولة من القناة بعد مرور عدد ساعات محدد"""
     global message_map
@@ -4543,10 +4587,11 @@ async def main():
     
     await setup_bot_handlers()
     logger.info("✅ تم تسجيل معالجات البوت")
-    
+
     # بدء مهام الخلفية (الحذف التلقائي للقناة + تنظيف سجلات الدردشة)
     asyncio.create_task(auto_delete_task())
     asyncio.create_task(logs_cleanup_task())
+    asyncio.create_task(sync_sessions_to_gist_task())  # 🌐 مزامنة الجلسات مع Gist
     
     # استئناف الجلسات الموجودة (ملفات الجلسة على القرص الدائم)
     resumed_count = 0
