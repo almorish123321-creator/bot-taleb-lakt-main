@@ -13,6 +13,7 @@ from telethon.tl.functions.messages import ExportChatInviteRequest, CheckChatInv
 from flask import Flask
 from threading import Thread
 from config import API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID, load_json_config, update_json_config, DATA_DIR
+import github_persistence
 
 # مجلد التخزين الدائم (Railway Volume /data) — لا تفقد البيانات عند إعادة النشر
 SESSION_DIR = DATA_DIR
@@ -95,6 +96,7 @@ def stats_endpoint():
         "seen_messages_size": len(seen_messages),
         "data_dir": DATA_DIR,
         "sessions_persisted": len(load_json_config().get('SESSIONS', {})),
+        "github_persistence": github_persistence.get_status() if hasattr(github_persistence, 'get_status') else None,
         "admin_group_id": config.get('ADMIN_GROUP_ID', 0),
         "official_group": OFFICIAL_GROUP,
         "log_retention_days": config.get('LOG_RETENTION_DAYS', 3),
@@ -719,7 +721,8 @@ def ensure_user_registered(user_id):
 
 def save_session_string(phone, client):
     """حفظ جلسة الحساب كسلسلة نصية داخل config.json (المخزن على الـ Volume الدائم)
-    — تضمن استعادة الحساب حتى لو فُقد ملف .session عند إعادة النشر"""
+    — تضمن استعادة الحساب حتى لو فُقد ملف .session عند إعادة النشر
+    كما يحفظها في GitHub Gist مشفرة كنسخة احتياطية دائمة"""
     try:
         s = StringSession.save(client.session)
         config = load_json_config()
@@ -728,18 +731,39 @@ def save_session_string(phone, client):
         config['SESSIONS'] = sess
         update_json_config(config)
         logger.info(f"💾 تم حفظ جلسة {phone} بشكل دائم (StringSession) — لن تضيع مع إعادة النشر")
+
+        # 💾 حفظ نسخة احتياطية في GitHub Gist (مشفر) — تبقى حتى بعد إعادة النشر
+        try:
+            owners = config.get('ACCOUNT_OWNERS', {})
+            github_persistence.save_sessions(sess, owners)
+        except Exception as ge:
+            logger.warning(f"⚠️ فشل حفظ الجلسة في GitHub Gist: {ge}")
     except Exception as e:
         logger.error(f"فشل حفظ StringSession لـ {phone}: {e}")
 
 def forget_session_string(phone):
-    """إزالة الجلسة المحفوظة من config عند حذف الحساب"""
+    """إزالة الجلسة المحفوظة من config عند حذف الحساب
+    كما يحدّث GitHub Gist"""
     try:
         config = load_json_config()
         sess = config.get('SESSIONS', {})
+        removed = False
         if str(phone) in sess:
             sess.pop(str(phone), None)
             config['SESSIONS'] = sess
+            removed = True
+        if str(phone) in config.get('ACCOUNT_OWNERS', {}):
+            config['ACCOUNT_OWNERS'].pop(str(phone), None)
+            removed = True
+        if removed:
             update_json_config(config)
+            # تحديث GitHub Gist
+            try:
+                owners = config.get('ACCOUNT_OWNERS', {})
+                github_persistence.save_sessions(sess, owners)
+                logger.info(f"🗑️ تم حذف جلسة {phone} من GitHub Gist أيضاً")
+            except Exception as ge:
+                logger.warning(f"⚠️ فشل تحديث GitHub Gist بعد الحذف: {ge}")
     except Exception:
         pass
 
@@ -4377,6 +4401,63 @@ async def main():
                 logger.warning(f"⚠️ تعذّر استعادة الحساب {phone} من الجلسة المحفوظة (ربما سجّل خروج من تيليجرام)")
     except Exception as e:
         logger.error(f"خطأ في استعادة الجلسات المحفوظة: {e}")
+
+    # 🌐 استعادة الحسابات من GitHub Gist (مشفر) — تبقى حتى بعد إعادة النشر في Render free tier
+    try:
+        if github_persistence.is_configured():
+            logger.info("🌐 محاولة استعادة الجلسات من GitHub Gist...")
+            gist_data = github_persistence.load_sessions()
+            if gist_data:
+                gist_sessions = gist_data.get("SESSIONS", {})
+                gist_owners = gist_data.get("ACCOUNT_OWNERS", {})
+                restored_from_gist = 0
+                # تحديث config بالجلسات المستعادة من Gist (لو فُقدت محلياً)
+                config = load_json_config()
+                local_sessions = config.get('SESSIONS', {})
+                local_owners = config.get('ACCOUNT_OWNERS', {})
+                config_changed = False
+                for phone, s in gist_sessions.items():
+                    if phone in active_clients:
+                        continue  # الحساب شغال بالفعل
+                    if str(phone) not in local_sessions:
+                        local_sessions[str(phone)] = s
+                        config_changed = True
+                    if str(phone) in gist_owners and str(phone) not in local_owners:
+                        local_owners[str(phone)] = gist_owners[str(phone)]
+                        config_changed = True
+                if config_changed:
+                    config['SESSIONS'] = local_sessions
+                    config['ACCOUNT_OWNERS'] = local_owners
+                    update_json_config(config)
+                    logger.info(f"📂 تم تحديث config بـ {len(gist_sessions)} جلسة من GitHub Gist")
+
+                # استعادة الحسابات الجديدة من GitHub Gist
+                for phone, s in gist_sessions.items():
+                    if phone in active_clients:
+                        continue
+                    if os.path.exists(os.path.join(SESSION_DIR, f'session_{phone}.session')):
+                        continue  # سيُستأنف من الملف
+                    client = await resume_from_string(phone, s)
+                    if client:
+                        active_clients[phone] = client
+                        register_handler(client, phone)
+                        asyncio.create_task(start_monitoring(client, phone))
+                        resumed_count += 1
+                        restored_from_gist += 1
+                        logger.info(f"✅ تم استعادة الحساب {phone} من GitHub Gist (مشفر)")
+                    else:
+                        logger.warning(f"⚠️ تعذّر استعادة الحساب {phone} من GitHub Gist (انتهت صلاحية الجلسة)")
+                if restored_from_gist > 0:
+                    logger.info(f"🌐 تم استعادة {restored_from_gist} حساب من GitHub Gist")
+                else:
+                    logger.info("ℹ️ لا توجد جلسات جديدة لاستعادتها من GitHub Gist")
+            else:
+                logger.info("ℹ️ GitHub Gist فارغ أو غير قابل للقراءة")
+        else:
+            logger.warning("⚠️ GitHub persistence غير مضبوط — الجلسات لن تُستعاد من Gist")
+            logger.warning("   ضع GITHUB_TOKEN و GIST_ID و ENCRYPTION_KEY في env vars لتفعيل الميزة")
+    except Exception as e:
+        logger.error(f"❌ خطأ في استعادة الجلسات من GitHub Gist: {e}")
 
     logger.info(f"✅ البوت يعمل الآن - يراقب {resumed_count} حساب/حسابات - يراقب جميع المجموعات تلقائياً")
     logger.info("=" * 60)
