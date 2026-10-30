@@ -3318,9 +3318,31 @@ async def setup_bot_handlers():
         
         elif data == b'approve_groups':
             if not is_full_admin(user_id):
-                # 🔒 العزل: شاشة اعتمادات الجميع للأدمن الكامل فقط — العضو يدير قروباته هو فقط
-                text_mf, rows_mf = build_myfwd_screen(user_id, config)
-                await event.respond("🎯 إدارة قروبات باقي المستخدمين تحتاج رتبة أدمن.\n\nهذه شاشة قروباتك أنت:\n\n" + text_mf, buttons=rows_mf)
+                # 🔓 المستخدم العادي: يقدر يدخل اعتمادات الحسابات المراقبة لحساباته هو فقط
+                # (مو حق غيره)
+                owned = get_owned_accounts(user_id)
+                if not owned:
+                    text_mf, rows_mf = build_myfwd_screen(user_id, config)
+                    await event.respond(
+                        "ℹ️ **لا تملك حسابات مراقبة بعد.**\n\n"
+                        "هذه شاشة قروباتك أنت (إذا أضفت قروبات):\n\n" + text_mf,
+                        buttons=rows_mf
+                    )
+                    return
+                # عرض شاشة اعتمادات الحسابات المراقبة مباشرة (لحسابات المستخدم فقط)
+                ag_map = config.get('ACCOUNT_GROUPS', {})
+                rows = []
+                for phone in owned:
+                    cnt = len(ag_map.get(str(phone), []))
+                    rows.append([Button.inline(f"📱 {phone} ({cnt} قروب)", f"accsel_{phone}".encode())])
+                rows.append([Button.inline('🎯 قروب توجيه رسائلي (شخصي)', b'myfwd')])
+                rows.append([Button.inline('🔙 رجوع', b'back_main')])
+                await event.respond(
+                    "📱 **اعتمادات حساباتك المراقبة**\n\n"
+                    "اختر حساباً لتحديد القروبات التي ستستقبل نسخ الرسائل الملتقطة منه:\n\n"
+                    "💡 يمكنك أيضاً اعتماد قروب توجيه شخصي لكل رسائلك من زر 🎯.",
+                    buttons=rows
+                )
                 return
             users = config.get('ADMINS', [])
             fg = config.get('FORWARD_GROUPS', [])
@@ -3348,33 +3370,40 @@ async def setup_bot_handlers():
         # ============ اعتماد قروبات التوجيه لكل حساب مراقب مباشرة ============
 
         elif data == b'accsel_menu':
-            if not is_full_admin(user_id):
-                await event.answer("🚫 هذه الشاشة للأدمن — اعتمد قروبك من 🎯 قروب توجيه رسائلي.", alert=True)
-                return
+            # 📱 اعتمادات الحسابات المراقبة
+            # - الأدمن الكامل: يشوف كل الحسابات
+            # - المستخدم العادي: يشوف حساباته هو فقط (مو حق غيره)
             ag_map = config.get('ACCOUNT_GROUPS', {})
-            if not active_clients:
+            owned = get_owned_accounts(user_id) if not is_full_admin(user_id) else list(active_clients.keys())
+            if not owned:
+                if is_full_admin(user_id):
+                    msg_tail = "\n\nأضف حساباً أولاً من ➕ إضافة حساب."
+                else:
+                    msg_tail = "\n\nأضف حسابك أولاً من ➕ إضافة حسابي."
                 await event.respond(
-                    "❌ لا توجد حسابات مراقبة مربوطة حالياً."
-                    "\n\nأضف حساباً أولاً من ➕ إضافة حساب.",
+                    f"❌ لا توجد حسابات مراقبة مربوطة بحسابك.{msg_tail}",
                     buttons=[[Button.inline('🔙 رجوع', b'approve_groups')]]
                 )
-            else:
-                rows = []
-                for phone in active_clients.keys():
-                    cnt = len(ag_map.get(str(phone), []))
-                    rows.append([Button.inline(f"📱 {phone} ({cnt} قروب)", f"accsel_{phone}".encode())])
-                rows.append([Button.inline('🔙 رجوع', b'approve_groups')])
-                await event.respond(
-                    "📱 **اعتمادات الحسابات المراقبة**\n\n"
-                    "اختر حساباً لتحديد القروبات التي ستستقبل نسخ الرسائل الملتقطة منه:",
-                    buttons=rows
-                )
+                return
+            rows = []
+            for phone in owned:
+                cnt = len(ag_map.get(str(phone), []))
+                rows.append([Button.inline(f"📱 {phone} ({cnt} قروب)", f"accsel_{phone}".encode())])
+            rows.append([Button.inline('🔙 رجوع', b'approve_groups')])
+            await event.respond(
+                "📱 **اعتمادات الحسابات المراقبة**\n\n"
+                "اختر حساباً لتحديد القروبات التي ستستقبل نسخ الرسائل الملتقطة منه:",
+                buttons=rows
+            )
 
         elif data.startswith(b'accsel_'):
             phone = data.decode()[7:]
+            # فحص الصلاحية: الأدمن الكامل أو مالك الحساب فقط
             if not is_full_admin(user_id):
-                await event.answer("🚫 هذه الشاشة للأدمن — اعتمد قروبك من 🎯 قروب توجيه رسائلي.", alert=True)
-                return
+                owned = get_owned_accounts(user_id)
+                if phone not in owned:
+                    await event.answer("🚫 يمكنك إدارة حساباتك أنت فقط.", alert=True)
+                    return
             if not phone:
                 await event.respond("❌ بيانات غير صحيحة.")
                 return
@@ -3403,9 +3432,12 @@ async def setup_bot_handlers():
             except (ValueError, IndexError):
                 await event.answer("❌ بيانات غير صحيحة.", alert=True)
                 return
+            # فحص الصلاحية: الأدمن الكامل أو مالك الحساب فقط
             if not is_full_admin(user_id):
-                await event.answer("🚫 اعتمادات حسابات الآخرين للأدمن فقط — استخدم 🎯 قروب توجيه رسائلي.", alert=True)
-                return
+                owned = get_owned_accounts(user_id)
+                if phone not in owned:
+                    await event.answer("🚫 يمكنك إدارة حساباتك أنت فقط.", alert=True)
+                    return
             ag_map = config.get('ACCOUNT_GROUPS', {})
             lst = ag_map.get(phone, [])
             if gid in lst:
@@ -3527,16 +3559,19 @@ async def setup_bot_handlers():
                 pass
         
         elif data == b'add_fwd_group_btn':
-            if not is_full_admin(user_id):
-                await event.answer("🚫 الإضافة للقائمة العامة للأدمن — اعتمد قروبك من 🎯 قروب توجيه رسائلي.", alert=True)
-                return
+            # متاح لكل المستخدمين — المستخدم العادي يضيف قروبه للقائمة العامة
+            # ويعتمده لنفسه أو لحساباته تلقائياً
             login_states[user_id] = {'step': 'add_fwd_group'}
             await event.respond(
-                "📝 أرسل بيانات القروب بأحد الصيغ:\n\n"
+                "📝 أرسل بيانات القروب أو القناة بأحد الصيغ:\n\n"
                 "• المعرّف الرقمي (مثال: `-1001234567890`)\n"
                 "• اسم المستخدم العام (مثال: `@mygroup`)\n"
-                "• رابط القروب (مثال: `https://t.me/mygroup`)\n\n"
-                "⚠️ يجب أن يكون البوت عضواً في القروب ليعمل التوجيه."
+                "• رابط القروب/القناة (مثال: `https://t.me/mygroup`)\n"
+                "• رابط دعوة خاص (مثال: `https://t.me/+abc123`)\n\n"
+                "✅ **يدعم:** القروبات العامة + القروبات الخاصة + القنوات\n\n"
+                "⚠️ يجب أن يكون البوت عضواً في القروب/القناة ويملك صلاحية الإرسال.\n"
+                "✅ سيُعتمد القروب **تلقائياً** بعد التحقق من الصلاحية.\n"
+                "💡 للإلغاء أرسل: `/cancel`"
             )
         
         # ============ 🎯 قروب توجيه رسائلي (خدمة ذاتية لكل مستخدم — عزل تام) ============
@@ -3839,35 +3874,96 @@ async def setup_bot_handlers():
 
         # ===== إضافة قروب توجيه إلى قائمة الاعتمادات =====
         elif state['step'] == 'add_fwd_group':
-            if not has_perm(user_id, 'manage_groups'):
-                await event.respond("🚫 لا تملك صلاحية اعتماد القروبات.")
-                del login_states[user_id]
-                return
+            # متاح لكل المستخدمين — المستخدم العادي يضيف القروب للقائمة العامة
+            # ويعتمده لحساباته تلقائياً
             raw = text.replace('https://t.me/', '@').replace('t.me/', '@').strip()
             try:
-                entity = await bot.get_entity(raw)
-                gid = int(entity.chat_id if hasattr(entity, 'chat_id') and entity.chat_id else entity.id)
-                title = getattr(entity, 'title', None) or str(gid)
+                # محاولة جلب entity (لو القروب عام أو البوت عضو)
+                try:
+                    entity = await bot.get_entity(raw)
+                    gid = int(entity.chat_id if hasattr(entity, 'chat_id') and entity.chat_id else entity.id)
+                    title = getattr(entity, 'title', None) or str(gid)
+                except Exception:
+                    # لو ما قدرنا نجلب entity، نحاول نفسر الرقم فقط
+                    m_num = re.match(r'^-?\d+$', raw.lstrip('@'))
+                    if m_num:
+                        gid = int(m_num.group())
+                        title = str(gid)
+                    else:
+                        raise ValueError(f"تعذر التعرف على القروب: {raw}")
+
                 fg = config.get('FORWARD_GROUPS', [])
-                if any(g.get('id') == gid for g in fg):
-                    await event.respond(f"ℹ️ القروب **{title}** (`{gid}`) موجود بالفعل في قائمة الاعتمادات.")
-                else:
+                already_fg = any(g.get('id') == gid for g in fg)
+                if not already_fg:
                     fg.append({'id': gid, 'title': title})
                     config['FORWARD_GROUPS'] = fg
-                    update_json_config(config)
-                    save_group_settings_to_gist()
+
+                # للمستخدم العادي: اعتماد القروب لحساباته تلقائياً
+                if not is_full_admin(user_id):
+                    ug = config.get('USER_GROUPS', {})
+                    lst = ug.get(str(user_id), [])
+                    if gid not in lst:
+                        lst.append(gid)
+                    ug[str(user_id)] = lst
+                    config['USER_GROUPS'] = ug
+
+                # فحص صلاحية الإرسال تلقائياً
+                update_json_config(config)
+                try:
+                    await bot.send_message(
+                        gid,
+                        f"✅ **تم اعتماد هذا القروب/القناة للتوجيه**\n\n"
+                        f"👤 المستخدم: `{user_id}`\n"
+                        f"📨 ستصل هنا نسخ من رسائل حساباتك الملتقطة.\n"
+                        f"🗑 للإلغاء: أرسل `/unmyfwd` هنا أو احذفه من البوت"
+                    )
+                    test_ok = True
+                except Exception as te:
+                    test_ok = False
+                    err_msg = str(te)[:120]
+                    # لو فشل الإرسال، نلغي الاعتماد للمستخدم العادي
+                    if not is_full_admin(user_id):
+                        ug = config.get('USER_GROUPS', {})
+                        if gid in ug.get(str(user_id), []):
+                            ug[str(user_id)].remove(gid)
+                            config['USER_GROUPS'] = ug
+                        # ونحذف القروب من القائمة العامة لو كان مضاف حديثاً
+                        if not already_fg:
+                            config['FORWARD_GROUPS'] = [g for g in fg if g.get('id') != gid]
+                        update_json_config(config)
                     await event.respond(
-                        f"✅ تم إضافة القروب إلى قائمة الاعتمادات!\n\n"
+                        f"❌ **فشل الاعتماد — البوت لا يملك صلاحية الإرسال في هذا القروب/القناة.**\n\n"
+                        f"⚠️ تأكد من:\n"
+                        f"• البوت عضو في القروب/القناة\n"
+                        f"• البوت يملك صلاحية إرسال الرسائل (مشرف في القناة)\n\n"
+                        f"💡 أضف البوت كعضو/مشرف ثم أعد المحاولة.\n"
+                        f"تفاصيل: {err_msg}"
+                    )
+                    del login_states[user_id]
+                    return
+
+                if already_fg:
+                    await event.respond(
+                        f"ℹ️ القروب **{title}** (`{gid}`) موجود بالفعل في قائمة الاعتمادات.\n\n"
+                        f"✅ تم اعتماده لحسابك الآن (إن لم يكن معتمداً لديك).\n"
+                        f"📨 نسخ رسائل حساباتك الملتقطة ستُوجَّه إلى هذا القروب."
+                    )
+                else:
+                    extra_note = ""
+                    if not is_full_admin(user_id):
+                        extra_note = "\n✅ تم اعتماده لحسابك تلقائياً — نسخ رسائل حساباتك ستُوجَّه إليه."
+                    await event.respond(
+                        f"✅ **تم إضافة القروب إلى قائمة الاعتمادات!**\n\n"
                         f"📦 القروب: {title} (`{gid}`)\n"
-                        f"📊 إجمالي القروبات المعتمدة: {len(fg)}\n\n"
-                        f"💡 الآن اعتمده لمستخدم أو حساب من: ✅ اعتمادات قروبات التوجيه"
+                        f"📊 إجمالي القروبات المعتمدة: {len(config.get('FORWARD_GROUPS', []))}{extra_note}\n\n"
+                        f"💡 لإدارة اعتمادات الحسابات: ✅ اعتمادات قروبات التوجيه → 📱 اعتمادات الحسابات المراقبة"
                     )
                     logger.info(f"📦 تم إضافة قروب توجيه: {gid} ({title}) بواسطة {user_id}")
             except Exception as e:
                 await event.respond(
                     f"❌ لم أتمكن من التعرف على القروب.\n\n"
                     f"⚠️ تأكد أن البوت عضو في القروب وأن الصيغة صحيحة:\n"
-                    f"• معرّف رقمي (مثال: `-1001234567890`)\n• @username أو رابط t.me\n\n"
+                    f"• معرّف رقمي (مثال: `-1001234567890`)\n• @username أو رابط t.me\n• رابط دعوة خاص t.me/+hash\n\n"
                     f"تفاصيل الخطأ: {str(e)[:120]}"
                 )
             del login_states[user_id]
