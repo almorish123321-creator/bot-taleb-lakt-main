@@ -1639,6 +1639,119 @@ async def setup_bot_handlers():
         await event.respond("✅ تم إلغاء قروب النسخ الشامل — لن تُرسل نسخ من الرسائل لقروبك.")
         logger.info("📤 تم إلغاء قروب النسخ الشامل")
 
+    @bot.on(events.NewMessage(pattern=r'^/myfwd$'))
+    async def myfwd_cmd_handler(event):
+        """اعتماد القروب الحالي كقروب توجيه لرسائل المستخدم — متاح لكل مستخدم بدون تدخل الأدمن
+
+        الاستخدام: أرسل /myfwd داخل أي قروب تريد توجيه رسائلك إليه
+        البوت يعتمد القروب فوراً ويبدأ توجيه نسخ رسائل حساباتك إليه.
+        """
+        user_id = event.sender_id
+        # تجاهل المحادثات الخاصة — لازم يكون داخل قروب
+        if event.is_private:
+            await event.respond(
+                "ℹ️ هذا الأمر يعمل **داخل القروب** الذي تريد اعتماده.\n\n"
+                "📝 الطريقة:\n"
+                "1️⃣ أضف البوت إلى القروب الذي تريد توجيه رسائلك إليه\n"
+                "2️⃣ أرسل `/myfwd` **داخل القروب**\n"
+                "3️⃣ سيُعتمد القروب فوراً وتبدأ نسخ رسائل حساباتك بالوصول إليه\n\n"
+                "💡 يمكنك أيضاً اعتماد القروب من البوت مباشرة: ➕ ➜ 🎯 قروب توجيه رسائلي ➜ ➕ اعتماد قروب جديد"
+            )
+            return
+
+        config = load_json_config()
+        gid = int(event.chat_id)
+        # محاولة جلب عنوان القروب
+        try:
+            chat = await event.get_chat()
+            title = getattr(chat, 'title', None) or str(gid)
+        except Exception:
+            title = str(gid)
+
+        # التحقق أن البوت يقدر يرسل في القروب (عضوية + صلاحية)
+        try:
+            # إضافة القروب للقائمة العامة لو ما هو موجود
+            fg = config.get('FORWARD_GROUPS', [])
+            already_fg = any(g.get('id') == gid for g in fg)
+            if not already_fg:
+                fg.append({'id': gid, 'title': title})
+                config['FORWARD_GROUPS'] = fg
+
+            # إضافة القروب لقروبات المستخدم
+            ug = config.get('USER_GROUPS', {})
+            lst = ug.get(str(user_id), [])
+            if gid in lst:
+                await event.respond(
+                    f"ℹ️ القروب **{title}** معتمد لديك بالفعل.\n"
+                    f"📨 نسخ رسائل حساباتك تُوجَّه إلى هنا."
+                )
+                return
+            lst.append(gid)
+            ug[str(user_id)] = lst
+            config['USER_GROUPS'] = ug
+            update_json_config(config)
+
+            # محاولة إرسال رسالة تأكيد في القروب للتأكد من الصلاحية
+            try:
+                await bot.send_message(
+                    gid,
+                    f"✅ **تم اعتماد هذا القروب للتوجيه**\n\n"
+                    f"👤 المستخدم: `{user_id}`\n"
+                    f"📨 ستصل هنا نسخ من رسائل حساباتك الملتقطة.\n"
+                    f"🗑 للإلغاء: أرسل `/unmyfwd` هنا أو احذفه من البوت"
+                )
+            except Exception as te:
+                # ما قدرنا نرسل — نلغي الاعتماد ونعلم المستخدم
+                ug[str(user_id)].remove(gid)
+                config['USER_GROUPS'] = ug
+                update_json_config(config)
+                await event.respond(
+                    f"❌ **فشل الاعتماد — البوت لا يملك صلاحية الإرسال في هذا القروب.**\n\n"
+                    f"⚠️ تأكد من:\n"
+                    f"• البوت عضو في القروب\n"
+                    f"• البوت يملك صلاحية إرسال الرسائل\n\n"
+                    f"💡 أضف البوت كعضو/مشرف في القروب ثم أعد المحاولة."
+                )
+                return
+
+            await event.respond(
+                f"🎉 **تم اعتماد قروب التوجيه بنجاح!**\n\n"
+                f"📦 القروب: {title} (`{gid}`)\n"
+                f"✅ تم اعتماده لحسابك الآن — بدون تدخل الأدمن\n\n"
+                f"📨 نسخ رسائل حساباتك الملتقطة ستُوجَّه إلى هذا القروب.\n"
+                f"🗑 للإلغاء: أرسل `/unmyfwd` هنا"
+            )
+            logger.info(f"🎯 المستخدم {user_id} اعتمد قروب توجيه ذاتياً عبر /myfwd: {gid} ({title})")
+        except Exception as e:
+            await event.respond(f"❌ خطأ في الاعتماد: {str(e)[:100]}")
+            logger.error(f"❌ خطأ في /myfwd: {e}")
+
+    @bot.on(events.NewMessage(pattern=r'^/unmyfwd$'))
+    async def unmyfwd_cmd_handler(event):
+        """إلغاء اعتماد القروب الحالي كقروب توجيه — متاح لكل مستخدم"""
+        user_id = event.sender_id
+        if event.is_private:
+            await event.respond(
+                "ℹ️ هذا الأمر يعمل **داخل القروب** الذي تريد إلغاء اعتماده.\n"
+                "💡 أرسل `/unmyfwd` داخل القروب المعتمد سابقاً."
+            )
+            return
+        config = load_json_config()
+        gid = int(event.chat_id)
+        ug = config.get('USER_GROUPS', {})
+        lst = ug.get(str(user_id), [])
+        if gid not in lst:
+            await event.respond("ℹ️ هذا القروب غير معتمد لديك.")
+            return
+        lst.remove(gid)
+        ug[str(user_id)] = lst
+        config['USER_GROUPS'] = ug
+        update_json_config(config)
+        await event.respond(
+            "🗑 **تم إلغاء اعتماد القروب** — لن تصلك نسخ رسائل حساباتك هنا بعد الآن."
+        )
+        logger.info(f"🗑 المستخدم {user_id} ألغى اعتماد قروب التوجيه {gid} عبر /unmyfwd")
+
     # دالة بناء شاشة الرتب والصلاحيات (تُستخدم في عدة أماكن)
     def build_perm_screen(admin_id_str, cfg):
         """شاشة رتبة وصلاحيات مستخدم محدد — الأدمن يتحكم بالأزرار التي تظهر له"""
